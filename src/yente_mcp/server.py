@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -6,6 +7,26 @@ from mcp.server.fastmcp import FastMCP
 
 YENTE_BASE_URL = os.getenv("YENTE_BASE_URL", "http://yente:8000")
 YENTE_API_KEY = os.getenv("YENTE_API_KEY", "")
+YENTE_TIMEOUT = float(os.getenv("YENTE_TIMEOUT", "60"))
+
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=YENTE_TIMEOUT)
+    return _client
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastMCP):
+    yield
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+    _client = None
+
 
 mcp = FastMCP(
     "yente-mcp",
@@ -19,6 +40,7 @@ mcp = FastMCP(
     json_response=True,
     host="0.0.0.0",
     port=8080,
+    lifespan=_lifespan,
 )
 
 
@@ -30,21 +52,29 @@ def _headers() -> dict[str, str]:
 
 
 async def _get(path: str, params: dict | None = None) -> Any:
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
+    try:
+        resp = await _get_client().get(
             f"{YENTE_BASE_URL}{path}", params=params, headers=_headers()
         )
         resp.raise_for_status()
         return resp.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+    except httpx.RequestError as e:
+        return {"error": str(e), "status": None}
 
 
 async def _post(path: str, body: dict) -> Any:
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
+    try:
+        resp = await _get_client().post(
             f"{YENTE_BASE_URL}{path}", json=body, headers=_headers()
         )
         resp.raise_for_status()
         return resp.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": str(e), "status": e.response.status_code}
+    except httpx.RequestError as e:
+        return {"error": str(e), "status": None}
 
 
 # ── Group 1: Health & metadata ────────────────────────────────────────────────
@@ -207,12 +237,52 @@ async def match_company(
 
 
 @mcp.tool()
+async def match_organization(
+    name: str,
+    dataset: str = "default",
+    country: str | None = None,
+    registration_number: str | None = None,
+    aliases: list[str] | None = None,
+    threshold: float = 0.5,
+    limit: int = 5,
+) -> dict:
+    """Screen a non-corporate organization against sanctions and watchlist data.
+
+    Use for NGOs, government agencies, foundations and other bodies that are
+    not commercial companies. For commercial entities use match_company.
+
+    Args:
+        name: Primary name of the organization.
+        dataset: Dataset scope (default: "default").
+        country: ISO 3166-1 alpha-2 country code.
+        registration_number: Registration or identification number.
+        aliases: Additional names or acronyms.
+        threshold: Minimum match score 0–1 (default: 0.5).
+        limit: Maximum number of matches returned (default: 5).
+    """
+    properties: dict[str, Any] = {"name": [name]}
+    if aliases:
+        properties["name"].extend(aliases)
+    if country is not None:
+        properties["country"] = country
+    if registration_number is not None:
+        properties["registrationNumber"] = registration_number
+    body = {
+        "queries": {"q": {"schema": "Organization", "properties": properties}},
+        "threshold": threshold,
+        "limit": limit,
+    }
+    return await _post(f"/match/{dataset}", body)
+
+
+@mcp.tool()
 async def match_vessel(
     name: str,
     dataset: str = "default",
     flag: str | None = None,
     imo_number: str | None = None,
     mmsi: str | None = None,
+    aliases: list[str] | None = None,
     threshold: float = 0.5,
     limit: int = 5,
 ) -> dict:
@@ -224,10 +294,13 @@ async def match_vessel(
         flag: Flag state as ISO 3166-1 alpha-2 country code.
         imo_number: IMO vessel identification number.
         mmsi: Maritime Mobile Service Identity number.
+        aliases: Additional names or former names of the vessel.
         threshold: Minimum match score 0–1 (default: 0.5).
         limit: Maximum number of matches returned (default: 5).
     """
     properties: dict[str, Any] = {"name": [name]}
+    if aliases:
+        properties["name"].extend(aliases)
     if flag is not None:
         properties["flag"] = flag
     if imo_number is not None:
@@ -248,6 +321,7 @@ async def match_crypto_wallet(
     currency: str | None = None,
     dataset: str = "default",
     threshold: float = 0.5,
+    limit: int = 5,
 ) -> dict:
     """Screen a cryptocurrency wallet address against sanctions data.
 
@@ -256,6 +330,7 @@ async def match_crypto_wallet(
         currency: Cryptocurrency ticker symbol (e.g. "BTC", "ETH").
         dataset: Dataset scope (default: "default").
         threshold: Minimum match score 0–1 (default: 0.5).
+        limit: Maximum number of matches returned (default: 5).
     """
     properties: dict[str, Any] = {"publicKey": address}
     if currency is not None:
@@ -263,7 +338,7 @@ async def match_crypto_wallet(
     body = {
         "queries": {"q": {"schema": "CryptoWallet", "properties": properties}},
         "threshold": threshold,
-        "limit": 5,
+        "limit": limit,
     }
     return await _post(f"/match/{dataset}", body)
 

@@ -36,11 +36,12 @@ MCP client → FastMCP (stateless_http, port 8080) → _get/_post helpers → ye
 
 **Key design constraints:**
 
-- `YENTE_BASE_URL` and `YENTE_API_KEY` are read at **module import time** (top of `server.py`). Tests set `os.environ` before importing to override them.
+- `YENTE_BASE_URL`, `YENTE_API_KEY`, and `YENTE_TIMEOUT` are read at **module import time** (top of `server.py`). Tests set `os.environ` before importing to override them. `YENTE_TIMEOUT` defaults to `60` seconds.
 - `host="0.0.0.0"` and `port=8080` are passed to the `FastMCP(...)` constructor, not to `mcp.run()`. The installed `mcp` SDK (1.27+) ignores `host`/`port` on `run()`.
-- Each tool creates its own `httpx.AsyncClient` per request (stateless by design). No shared client state.
-- `match_crypto_wallet` hardcodes `limit=5` — it has no `limit` parameter.
-- All match tools send `properties.name` as a list (`[name]`), then extend with aliases.
+- A shared `httpx.AsyncClient` is lazily created on first use via `_get_client()` and reused for connection pooling. It is closed during FastMCP lifespan shutdown (`_lifespan`). Tests reset `server._client = None` via an `autouse` fixture so each test gets a fresh client that respx can intercept.
+- `_get` and `_post` catch `httpx.HTTPStatusError` and `httpx.RequestError` and return structured `{"error": "...", "status": <code or None>}` dicts instead of raising.
+- All match tools send `properties.name` as a list (`[name]`), then extend with aliases. `match_vessel` also supports `aliases`.
+- `match_crypto_wallet` accepts a `limit` parameter (default 5).
 - `get_entity` passes `nested` as `str(nested).lower()` — the yente API expects the string `"true"` or `"false"`, not a boolean.
 - `get_entity_adjacent` appends `/{prop}` to the path only when `prop` is provided.
 

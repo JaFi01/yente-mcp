@@ -6,6 +6,7 @@ import pytest
 import respx
 import httpx
 
+import yente_mcp.server as server_module
 from yente_mcp.server import (
     health_check,
     get_status,
@@ -14,6 +15,7 @@ from yente_mcp.server import (
     search_entities,
     match_person,
     match_company,
+    match_organization,
     match_vessel,
     match_crypto_wallet,
     match_bulk,
@@ -23,6 +25,13 @@ from yente_mcp.server import (
 )
 
 BASE = "http://yente-test:8000"
+
+
+@pytest.fixture(autouse=True)
+def reset_http_client():
+    server_module._client = None
+    yield
+    server_module._client = None
 
 
 @pytest.mark.asyncio
@@ -131,11 +140,51 @@ async def test_match_company():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_match_organization():
+    respx.post(f"{BASE}/match/default").mock(
+        return_value=httpx.Response(200, json={"responses": {"q": {"results": []}}})
+    )
+    result = await match_organization("Red Cross")
+    assert "responses" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_match_organization_with_aliases():
+    respx.post(f"{BASE}/match/sanctions").mock(
+        return_value=httpx.Response(200, json={"responses": {"q": {"results": []}}})
+    )
+    result = await match_organization(
+        "Hamas",
+        dataset="sanctions",
+        country="ps",
+        aliases=["حماس", "Islamic Resistance Movement"],
+    )
+    assert "responses" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_match_vessel():
     respx.post(f"{BASE}/match/sanctions").mock(
         return_value=httpx.Response(200, json={"responses": {"q": {"results": []}}})
     )
     result = await match_vessel("Ever Given", dataset="sanctions")
+    assert "responses" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_match_vessel_with_aliases():
+    respx.post(f"{BASE}/match/sanctions").mock(
+        return_value=httpx.Response(200, json={"responses": {"q": {"results": []}}})
+    )
+    result = await match_vessel(
+        "Arctic Sea",
+        dataset="sanctions",
+        aliases=["Arktik More", "Polar Star"],
+        imo_number="9403905",
+    )
     assert "responses" in result
 
 
@@ -147,6 +196,19 @@ async def test_match_crypto_wallet():
     )
     result = await match_crypto_wallet("1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf")
     assert "responses" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_match_crypto_wallet_custom_limit():
+    route = respx.post(f"{BASE}/match/default").mock(
+        return_value=httpx.Response(200, json={"responses": {"q": {"results": []}}})
+    )
+    result = await match_crypto_wallet("1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf", limit=10)
+    assert "responses" in result
+    import json
+    body = json.loads(route.calls.last.request.content)
+    assert body["limit"] == 10
 
 
 @pytest.mark.asyncio
@@ -181,6 +243,7 @@ async def test_get_entity_nested():
     )
     result = await get_entity("NK-abc")
     assert result["id"] == "NK-abc"
+    assert respx.calls.last.request.url.params["nested"] == "true"
 
 
 @pytest.mark.asyncio
@@ -191,6 +254,7 @@ async def test_get_entity_flat():
     )
     result = await get_entity("NK-abc", nested=False)
     assert result["schema"] == "Person"
+    assert respx.calls.last.request.url.params["nested"] == "false"
 
 
 @pytest.mark.asyncio
@@ -227,3 +291,65 @@ async def test_reconcile():
     )
     result = await reconcile({"q0": {"query": "Vladimir Putin", "type": "Person", "limit": 3}})
     assert "q0" in result
+
+
+# ── Error path tests ──────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_returns_structured_error_on_404():
+    respx.get(f"{BASE}/entities/NK-missing").mock(
+        return_value=httpx.Response(404, json={"detail": "Entity not found"})
+    )
+    result = await get_entity("NK-missing")
+    assert result["status"] == 404
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_returns_structured_error_on_500():
+    respx.get(f"{BASE}/healthz").mock(
+        return_value=httpx.Response(500, json={"detail": "Internal server error"})
+    )
+    result = await health_check()
+    assert result["status"] == 500
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_post_returns_structured_error_on_404():
+    respx.post(f"{BASE}/match/unknown-dataset").mock(
+        return_value=httpx.Response(404, json={"detail": "Dataset not found"})
+    )
+    result = await match_person("John Doe", dataset="unknown-dataset")
+    assert result["status"] == 404
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_returns_structured_error_on_timeout():
+    respx.get(f"{BASE}/healthz").mock(side_effect=httpx.TimeoutException("request timed out"))
+    result = await health_check()
+    assert result["status"] is None
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_returns_structured_error_on_network_failure():
+    respx.get(f"{BASE}/healthz").mock(side_effect=httpx.ConnectError("connection refused"))
+    result = await health_check()
+    assert result["status"] is None
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_post_returns_structured_error_on_network_failure():
+    respx.post(f"{BASE}/match/default").mock(side_effect=httpx.ConnectError("connection refused"))
+    result = await match_person("John Doe")
+    assert result["status"] is None
+    assert "error" in result
